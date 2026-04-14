@@ -2,17 +2,20 @@
  * Chronomancer's Book — Discord Bot (Enhanced)
  * =============================================
  * - Posts new lists as embeds, sorted by time & category
+ * - Each category posts into its own Discord channel
  * - Users can create lists via /create-list slash command
  * - 5-minute pre-event notifications
  *
  * Environment variables:
- *   DISCORD_TOKEN            — Bot Token
- *   DISCORD_CHANNEL_ID       — Channel for list embeds
- *   DISCORD_NOTIFY_CHANNEL_ID— Channel for notifications (falls back to DISCORD_CHANNEL_ID)
- *   APP_URL                  — Web app URL
- *   APP_ADMIN_PASSWORD       — Admin password
- *   BOT_POLL_INTERVAL_MS     — Poll interval (default: 10000)
- *   BOT_CATEGORY_FILTER      — Comma-separated category names to filter (empty = all)
+ *   DISCORD_TOKEN              — Bot Token
+ *   DISCORD_CHANNEL_ID         — Fallback channel (used if no category-channel match)
+ *   DISCORD_NOTIFY_CHANNEL_ID  — Channel for notifications (falls back to DISCORD_CHANNEL_ID)
+ *   CATEGORY_CHANNEL_MAP       — JSON map of category name (lowercase) → channel ID
+ *                                e.g. '{"raids":"123456","pvp":"789012","events":"345678"}'
+ *   APP_URL                    — Web app URL
+ *   APP_ADMIN_PASSWORD         — Admin password
+ *   BOT_POLL_INTERVAL_MS       — Poll interval (default: 10000)
+ *   BOT_CATEGORY_FILTER        — Comma-separated category names to filter (empty = all)
  */
 
 'use strict';
@@ -34,16 +37,37 @@ const {
 } = require('discord.js');
 
 // ── Config ────────────────────────────────────────────────────────────────
-const DISCORD_TOKEN         = process.env.DISCORD_TOKEN          || '';
-const DISCORD_CHANNEL_ID    = process.env.DISCORD_CHANNEL_ID     || '';
+const DISCORD_TOKEN          = process.env.DISCORD_TOKEN           || '';
+const DISCORD_CHANNEL_ID     = process.env.DISCORD_CHANNEL_ID      || '';
 const DISCORD_NOTIFY_CHANNEL = process.env.DISCORD_NOTIFY_CHANNEL_ID || DISCORD_CHANNEL_ID;
-const APP_URL               = (process.env.APP_URL || 'http://localhost:3000').replace(/\/$/, '');
-const APP_ADMIN_PASSWORD    = process.env.APP_ADMIN_PASSWORD     || 'admin123';
-const POLL_INTERVAL         = parseInt(process.env.BOT_POLL_INTERVAL_MS || '10000', 10);
-const CATEGORY_FILTER_RAW   = process.env.BOT_CATEGORY_FILTER    || '';
-const CATEGORY_FILTER       = CATEGORY_FILTER_RAW
+const APP_URL                = (process.env.APP_URL || 'http://localhost:3000').replace(/\/$/, '');
+const APP_ADMIN_PASSWORD     = process.env.APP_ADMIN_PASSWORD      || 'admin123';
+const POLL_INTERVAL          = parseInt(process.env.BOT_POLL_INTERVAL_MS || '10000', 10);
+const CATEGORY_FILTER_RAW    = process.env.BOT_CATEGORY_FILTER     || '';
+const CATEGORY_FILTER        = CATEGORY_FILTER_RAW
   ? CATEGORY_FILTER_RAW.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
   : [];
+
+/**
+ * CATEGORY_CHANNEL_MAP — maps category name (lowercase) → Discord channel ID.
+ *
+ * Set via environment variable as JSON, e.g.:
+ *   CATEGORY_CHANNEL_MAP='{"raids":"1234567890","pvp":"0987654321","events":"1122334455"}'
+ *
+ * Category names are matched case-insensitively against the list's category_name.
+ * If no match is found, DISCORD_CHANNEL_ID is used as fallback.
+ */
+let CATEGORY_CHANNEL_MAP = {};
+try {
+  const raw = process.env.CATEGORY_CHANNEL_MAP || '{}';
+  const parsed = JSON.parse(raw);
+  // Normalise all keys to lowercase for case-insensitive matching
+  for (const [k, v] of Object.entries(parsed)) {
+    CATEGORY_CHANNEL_MAP[k.toLowerCase()] = String(v);
+  }
+} catch (err) {
+  console.error('⚠️  CATEGORY_CHANNEL_MAP is not valid JSON — using fallback channel for all categories.');
+}
 
 if (!DISCORD_TOKEN || !DISCORD_CHANNEL_ID) {
   console.error('❌  DISCORD_TOKEN and DISCORD_CHANNEL_ID must be set.');
@@ -102,7 +126,7 @@ async function ensureAdminSession() {
 }
 
 // ── State ─────────────────────────────────────────────────────────────────
-/** Map<listId, discordMessageId> */
+/** Map<listId, { messageId: string, channelId: string }> */
 const postedLists   = new Map();
 /** Map<listId, categoryColor> */
 const listColors    = new Map();
@@ -113,6 +137,16 @@ const notifiedLists = new Set();
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 // ── Helpers ───────────────────────────────────────────────────────────────
+
+/**
+ * Resolve the Discord channel ID for a given category name.
+ * Matching is case-insensitive. Falls back to DISCORD_CHANNEL_ID.
+ */
+function channelIdForCategory(categoryName) {
+  const key = (categoryName || '').toLowerCase();
+  return CATEGORY_CHANNEL_MAP[key] || DISCORD_CHANNEL_ID;
+}
+
 function hexColor(hex) {
   if (!hex) return 0x1a4a7a;
   return parseInt(hex.replace('#', ''), 16);
@@ -151,15 +185,12 @@ function buildProgressBar(pct) {
 /** Sort lists: first by date, then by time (untimed lists last within same date), then by category */
 function sortLists(lists) {
   return [...lists].sort((a, b) => {
-    // Primary: event_date
     if (a.event_date < b.event_date) return -1;
     if (a.event_date > b.event_date) return 1;
-    // Secondary: event_time (no time = '99:99' sorts last)
     const ta = a.event_time || '99:99';
     const tb = b.event_time || '99:99';
     if (ta < tb) return -1;
     if (ta > tb) return 1;
-    // Tertiary: category name
     return (a.category_name || '').localeCompare(b.category_name || '');
   });
 }
@@ -244,8 +275,13 @@ function buildButtons(listId) {
 
 // ── Post / Update messages ────────────────────────────────────────────────
 async function postOrUpdateList(list, catName, catColor) {
-  const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
-  if (!channel) return;
+  // Determine which Discord channel to use for this category
+  const targetChannelId = channelIdForCategory(catName);
+  const channel = await client.channels.fetch(targetChannelId).catch(() => null);
+  if (!channel) {
+    console.warn(`⚠️  Channel ${targetChannelId} not found for category "${catName}" (list ${list.id})`);
+    return;
+  }
 
   let signups = [];
   try {
@@ -256,17 +292,34 @@ async function postOrUpdateList(list, catName, catColor) {
   const embed   = buildEmbed(list, signups, catName, catColor);
   const buttons = buildButtons(list.id);
 
-  if (postedLists.has(list.id)) {
-    try {
-      const msg = await channel.messages.fetch(postedLists.get(list.id));
-      await msg.edit({ embeds: [embed], components: [buttons] });
-    } catch {
+  const existing = postedLists.get(list.id);
+
+  if (existing) {
+    // If the category (and therefore channel) changed, delete the old message and repost
+    if (existing.channelId !== targetChannelId) {
+      try {
+        const oldChannel = await client.channels.fetch(existing.channelId).catch(() => null);
+        if (oldChannel) {
+          const oldMsg = await oldChannel.messages.fetch(existing.messageId).catch(() => null);
+          if (oldMsg) await oldMsg.delete();
+        }
+      } catch { /* already gone */ }
       const msg = await channel.send({ embeds: [embed], components: [buttons] });
-      postedLists.set(list.id, msg.id);
+      postedLists.set(list.id, { messageId: msg.id, channelId: targetChannelId });
+    } else {
+      // Edit in place
+      try {
+        const msg = await channel.messages.fetch(existing.messageId);
+        await msg.edit({ embeds: [embed], components: [buttons] });
+      } catch {
+        // Message gone — repost
+        const msg = await channel.send({ embeds: [embed], components: [buttons] });
+        postedLists.set(list.id, { messageId: msg.id, channelId: targetChannelId });
+      }
     }
   } else {
     const msg = await channel.send({ embeds: [embed], components: [buttons] });
-    postedLists.set(list.id, msg.id);
+    postedLists.set(list.id, { messageId: msg.id, channelId: targetChannelId });
     listColors.set(list.id, catColor);
   }
 }
@@ -285,9 +338,9 @@ async function refreshListMessage(listId) {
 
 // ── 5-minute notifications ────────────────────────────────────────────────
 async function checkNotifications(lists) {
-  const now = Date.now();
+  const now    = Date.now();
   const FIVE_MIN = 5 * 60 * 1000;
-  const WINDOW   = 60 * 1000; // only notify within a 1-min window around 5min mark
+  const WINDOW   = 60 * 1000;
 
   for (const list of lists) {
     if (notifiedLists.has(list.id)) continue;
@@ -306,7 +359,6 @@ async function checkNotifications(lists) {
         const filled  = signups.filter(s => s.status !== 'standby').length;
         const free    = list.slots - filled;
 
-        // Mention all participants by looking up their slot names
         const participantNames = signups
           .filter(s => s.status !== 'standby')
           .map(s => escMd(s.nickname))
@@ -352,27 +404,28 @@ async function pollLists() {
     const filtered = upcoming.filter(l => categoryAllowed(l.category_name));
     const sorted   = sortLists(filtered);
 
-    // Check 5-min notifications
     await checkNotifications(sorted);
 
-    // Post/update new lists
     for (const list of sorted) {
       if (!postedLists.has(list.id)) {
-        console.log(`📬  New list: [${list.id}] ${list.title} (${list.category_name})`);
+        const targetChannelId = channelIdForCategory(list.category_name);
+        console.log(`📬  New list: [${list.id}] ${list.title} (${list.category_name}) → channel ${targetChannelId}`);
         await postOrUpdateList(list, list.category_name || '', list.category_color || '#1a4a7a');
         listColors.set(list.id, list.category_color || '#1a4a7a');
       }
     }
 
     // Remove messages for expired/filtered lists
-    for (const [listId, msgId] of postedLists) {
+    for (const [listId, { messageId, channelId }] of postedLists) {
       const stillExists = sorted.find(l => l.id === listId);
       if (!stillExists) {
-        console.log(`🗑️  List ${listId} expired — removing Discord message.`);
+        console.log(`🗑️  List ${listId} expired — removing Discord message from channel ${channelId}.`);
         try {
-          const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
-          const msg     = await channel.messages.fetch(msgId);
-          await msg.delete();
+          const channel = await client.channels.fetch(channelId).catch(() => null);
+          if (channel) {
+            const msg = await channel.messages.fetch(messageId).catch(() => null);
+            if (msg) await msg.delete();
+          }
         } catch { /* already gone */ }
         postedLists.delete(listId);
         listColors.delete(listId);
@@ -440,7 +493,13 @@ client.on('interactionCreate', async (interaction) => {
         if (!cats.length) {
           return interaction.editReply('No categories found.');
         }
-        const lines = cats.map(c => `• **${escMd(c.name)}**${c.description ? ` — ${escMd(c.description)}` : ''}`);
+        const lines = cats.map(c => {
+          const chId = channelIdForCategory(c.name);
+          const chNote = chId !== DISCORD_CHANNEL_ID
+            ? ` → <#${chId}>`
+            : ` → <#${DISCORD_CHANNEL_ID}> (fallback)`;
+          return `• **${escMd(c.name)}**${c.description ? ` — ${escMd(c.description)}` : ''}${chNote}`;
+        });
         const embed = new EmbedBuilder()
           .setColor(0x1a4a7a)
           .setTitle('🗂️ Available Categories')
@@ -459,12 +518,11 @@ client.on('interactionCreate', async (interaction) => {
       const title       = interaction.options.getString('title');
       const dateStr     = interaction.options.getString('date');
       const categoryStr = interaction.options.getString('category');
-      const slots       = interaction.options.getInteger('slots')  || 10;
-      const timeStr     = interaction.options.getString('time')     || '';
-      const description = interaction.options.getString('description') || '';
-      const ch          = interaction.options.getInteger('channel') || 1;
+      const slots       = interaction.options.getInteger('slots')      || 10;
+      const timeStr     = interaction.options.getString('time')         || '';
+      const description = interaction.options.getString('description')  || '';
+      const ch          = interaction.options.getInteger('channel')     || 1;
 
-      // Validate date format
       if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
         return interaction.editReply('❌ Invalid date format. Use `YYYY-MM-DD` (e.g. `2025-12-31`).');
       }
@@ -473,7 +531,6 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       try {
-        // Find or match category (case-insensitive)
         const cats = await apiGet('/api/categories');
         const cat  = cats.find(c => c.name.toLowerCase() === categoryStr.toLowerCase());
 
@@ -498,15 +555,18 @@ client.on('interactionCreate', async (interaction) => {
           return interaction.editReply(`❌ Error: ${result.error}`);
         }
 
+        const targetChannelId = channelIdForCategory(cat.name);
+
         const embed = new EmbedBuilder()
           .setColor(hexColor(cat.color))
           .setTitle(`✅ List Created: ${title}`)
           .addFields(
-            { name: '🗂️ Category', value: cat.name,           inline: true },
-            { name: '📅 Date',     value: fmtDate(dateStr),   inline: true },
-            { name: '🕐 Time',     value: timeStr || '–',     inline: true },
-            { name: '🪑 Slots',    value: String(slots),      inline: true },
-            { name: '📡 Channel',  value: `Ch. ${ch}`,        inline: true },
+            { name: '🗂️ Category', value: cat.name,               inline: true },
+            { name: '📅 Date',     value: fmtDate(dateStr),       inline: true },
+            { name: '🕐 Time',     value: timeStr || '–',         inline: true },
+            { name: '🪑 Slots',    value: String(slots),          inline: true },
+            { name: '📡 Channel',  value: `Ch. ${ch}`,            inline: true },
+            { name: '📢 Posted to', value: `<#${targetChannelId}>`, inline: true },
           )
           .setFooter({ text: 'The list will appear in the channel shortly.' });
 
@@ -514,7 +574,6 @@ client.on('interactionCreate', async (interaction) => {
 
         await interaction.editReply({ embeds: [embed] });
 
-        // Immediately poll to post it
         await pollLists();
 
       } catch (err) {
@@ -530,7 +589,6 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.isButton()) {
     const id = interaction.customId;
 
-    // Refresh
     if (id.startsWith('refresh__')) {
       const listId = parseInt(id.split('__')[1], 10);
       await interaction.deferUpdate();
@@ -538,7 +596,6 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    // Signup buttons — open modal
     if (id.startsWith('signup_sure__') || id.startsWith('signup_maybe__')) {
       const parts  = id.split('__');
       const status = parts[0].replace('signup_', '');
@@ -637,9 +694,20 @@ client.on('interactionCreate', async (interaction) => {
 // ── Ready ─────────────────────────────────────────────────────────────────
 client.once('ready', async () => {
   console.log(`✅  Bot logged in as: ${client.user.tag}`);
-  console.log(`📡  List channel:     ${DISCORD_CHANNEL_ID}`);
+  console.log(`📡  Fallback channel: ${DISCORD_CHANNEL_ID}`);
   console.log(`🔔  Notify channel:   ${DISCORD_NOTIFY_CHANNEL}`);
   console.log(`🌐  Web App:          ${APP_URL}`);
+
+  const mappedCategories = Object.entries(CATEGORY_CHANNEL_MAP);
+  if (mappedCategories.length) {
+    console.log('🗂️  Category → Channel mappings:');
+    for (const [cat, chId] of mappedCategories) {
+      console.log(`     "${cat}" → ${chId}`);
+    }
+  } else {
+    console.log('⚠️  No CATEGORY_CHANNEL_MAP set — all categories post to fallback channel.');
+  }
+
   if (CATEGORY_FILTER.length) console.log(`🔍  Category filter: ${CATEGORY_FILTER.join(', ')}`);
 
   await ensureAdminSession();
