@@ -2,23 +2,13 @@
  * Chronomancer's Book — Discord Bot (Enhanced v2)
  * ================================================
  * NEW FEATURES:
- *  - 5-minute pre-event notifications (improved)
- *  - Users can request slot removal via Discord button
- *  - Admins can link their Discord user ID via /link-admin
- *  - Linked admins receive DM or channel notifications for removal requests
- *  - Admins can approve/deny removal requests directly in Discord
- *  - Multi-admin support
- *
- * Environment variables:
- *   DISCORD_TOKEN              — Bot Token
- *   DISCORD_CHANNEL_ID         — Fallback channel
- *   DISCORD_NOTIFY_CHANNEL_ID  — Channel for notifications
- *   DISCORD_ADMIN_CHANNEL_ID   — Channel where removal requests are posted (optional, falls back to notify channel)
- *   CATEGORY_CHANNEL_MAP       — JSON map of category name → channel ID
- *   APP_URL                    — Web app URL
- *   APP_ADMIN_PASSWORD         — Admin password
- *   BOT_POLL_INTERVAL_MS       — Poll interval (default: 10000)
- *   BOT_CATEGORY_FILTER        — Comma-separated category names to filter
+ * - 5-minute pre-event notifications (improved) + Direct Messages
+ * - Waitlist System with Auto-Promotion
+ * - Users can request slot removal via Discord button
+ * - Admins can link their Discord user ID via /link-admin
+ * - Linked admins receive DM or channel notifications for removal requests
+ * - Admins can approve/deny removal requests directly in Discord
+ * - Multi-admin support
  */
 
 'use strict';
@@ -56,8 +46,6 @@ const CATEGORY_FILTER         = CATEGORY_FILTER_RAW
   : [];
 
 // ── Admin Discord ID store ─────────────────────────────────────────────────
-// Persists to disk so linked admins survive restarts.
-// Maps discordUserId → { discordUserId, linkedAt }
 const ADMIN_STORE_PATH = path.join(__dirname, 'data', 'discord_admins.json');
 
 function loadAdminStore() {
@@ -79,7 +67,6 @@ function saveAdminStore(store) {
   }
 }
 
-/** { [discordUserId]: { discordUserId, linkedAt } } */
 let adminStore = loadAdminStore();
 
 function isLinkedAdmin(discordUserId) {
@@ -169,15 +156,10 @@ async function ensureAdminSession() {
 }
 
 // ── State ─────────────────────────────────────────────────────────────────
-/** Map<listId, { messageId: string, channelId: string }> */
 const postedLists   = new Map();
-/** Map<listId, categoryColor> */
 const listColors    = new Map();
-/** Set<listId> — lists that already got a notification */
 const notifiedLists = new Set();
-/** Map<requestId, { messageId, channelId }> — posted removal request messages */
 const postedRequests = new Map();
-/** Set<requestId> — already processed requests */
 const processedRequests = new Set();
 
 // ── Discord Client ────────────────────────────────────────────────────────
@@ -243,19 +225,36 @@ function getEventDt(list) {
 
 // ── Embed builder ─────────────────────────────────────────────────────────
 function buildEmbed(list, signups, catName, catColor) {
-  const filled     = signups.filter(s => s.status !== 'standby').length;
+  const filled     = signups.filter(s => s.status !== 'standby' && s.slot_number <= list.slots).length;
   const free       = list.slots - filled;
   const pct        = list.slots ? Math.round((filled / list.slots) * 100) : 0;
   const bar        = buildProgressBar(pct);
   const timeStr    = list.event_time ? ` · 🕐 ${list.event_time}` : '';
   const channelStr = list.channel    ? ` · 📡 Ch. ${list.channel}` : '';
 
-  const slotLines = Array.from({ length: list.slots }, (_, i) => {
-    const n      = i + 1;
+  const slotLines = [];
+  
+  // Normal Slots
+  for (let i = 0; i < list.slots; i++) {
+    const n = i + 1;
     const signup = signups.find(s => s.slot_number === n);
-    if (!signup) return `\`#${String(n).padStart(2, '0')}\` ░ free`;
-    return `\`#${String(n).padStart(2, '0')}\` ${slotStatusEmoji(signup.status)} **${escMd(signup.nickname)}**`;
-  });
+    if (!signup) {
+      slotLines.push(`\`#${String(n).padStart(2, '0')}\` ░ free`);
+    } else {
+      const name = signup.discord_id ? `<@${signup.discord_id}>` : escMd(signup.nickname);
+      slotLines.push(`\`#${String(n).padStart(2, '0')}\` ${slotStatusEmoji(signup.status)} **${name}**`);
+    }
+  }
+
+  // Waitlist
+  const waiting = signups.filter(s => s.slot_number > list.slots).sort((a,b) => a.slot_number - b.slot_number);
+  if (waiting.length > 0) {
+    slotLines.push('\n**⏳ Warteliste (Reserviert):**');
+    waiting.forEach((s, idx) => {
+      const name = s.discord_id ? `<@${s.discord_id}>` : escMd(s.nickname);
+      slotLines.push(`\`R${idx+1}\` ${slotStatusEmoji(s.status)} **${name}**`);
+    });
+  }
 
   const CHUNK = 20;
   const chunks = [];
@@ -390,11 +389,6 @@ async function refreshListMessage(listId) {
 }
 
 // ── Removal Request notifications ─────────────────────────────────────────
-/**
- * Notify all linked admins about a new removal request.
- * Posts an embed to DISCORD_ADMIN_CHANNEL with Accept/Deny buttons.
- * Also sends DMs to each linked admin as a backup notification.
- */
 async function notifyAdminsOfRequest(req) {
   if (processedRequests.has(req.id)) return;
 
@@ -413,7 +407,6 @@ async function notifyAdminsOfRequest(req) {
 
   const buttons = buildRequestButtons(req.id);
 
-  // Post to admin channel
   try {
     const adminChannel = await client.channels.fetch(DISCORD_ADMIN_CHANNEL).catch(() => null);
     if (adminChannel) {
@@ -423,13 +416,11 @@ async function notifyAdminsOfRequest(req) {
         components: [buttons],
       });
       postedRequests.set(req.id, { messageId: msg.id, channelId: DISCORD_ADMIN_CHANNEL });
-      console.log(`📨  Posted removal request ${req.id} to admin channel.`);
     }
   } catch (err) {
     console.error('Failed to post to admin channel:', err.message);
   }
 
-  // DM each linked admin
   const linkedIds = getLinkedAdminIds();
   for (const discordId of linkedIds) {
     try {
@@ -440,17 +431,12 @@ async function notifyAdminsOfRequest(req) {
         embeds: [embed],
         components: [buttons],
       });
-      console.log(`📩  DM sent to linked admin ${discordId}`);
     } catch (err) {
-      // DMs may be disabled — not critical
       console.warn(`⚠️  Could not DM admin ${discordId}: ${err.message}`);
     }
   }
 }
 
-/**
- * Poll pending removal requests and notify admins of any new ones.
- */
 async function pollRemovalRequests() {
   try {
     const requests = await apiGet('/api/delete-requests');
@@ -468,9 +454,6 @@ async function pollRemovalRequests() {
   }
 }
 
-/**
- * Update (or disable) the admin message buttons after a request is resolved.
- */
 async function resolveRequestMessage(requestId, accepted, adminTag) {
   processedRequests.add(requestId);
   const posted = postedRequests.get(requestId);
@@ -499,7 +482,7 @@ async function resolveRequestMessage(requestId, accepted, adminTag) {
 async function checkNotifications(lists) {
   const now      = Date.now();
   const FIVE_MIN = 5 * 60 * 1000;
-  const WINDOW   = 60 * 1000; // 1-minute window so we don't miss it
+  const WINDOW   = 60 * 1000;
 
   for (const list of lists) {
     if (notifiedLists.has(list.id)) continue;
@@ -519,23 +502,13 @@ async function sendFiveMinNotification(list) {
   try {
     const full    = await apiGet(`/api/lists/${list.id}`);
     const signups = full.signups || [];
-    const filled  = signups.filter(s => s.status !== 'standby').length;
+    const filled  = signups.filter(s => s.status !== 'standby' && s.slot_number <= list.slots).length;
     const free    = list.slots - filled;
 
     const participantNames = signups
-      .filter(s => s.status !== 'standby')
-      .map(s => escMd(s.nickname))
+      .filter(s => s.status !== 'standby' && s.slot_number <= list.slots)
+      .map(s => s.discord_id ? `<@${s.discord_id}>` : escMd(s.nickname))
       .join(', ') || '–';
-
-    const maybeNames = signups
-      .filter(s => s.status === 'maybe')
-      .map(s => escMd(s.nickname))
-      .join(', ');
-
-    const standbyNames = signups
-      .filter(s => s.status === 'standby')
-      .map(s => escMd(s.nickname))
-      .join(', ');
 
     const embed = new EmbedBuilder()
       .setColor(0xff4444)
@@ -545,16 +518,7 @@ async function sendFiveMinNotification(list) {
         { name: '🗂️ Category',     value: list.category_name || '–',                              inline: true },
         { name: '🪑 Slots',        value: `${filled}/${list.slots} filled (${free} free)`,        inline: true },
         { name: '✅ Confirmed',     value: participantNames || '–',                                inline: false },
-      );
-
-    if (maybeNames) {
-      embed.addFields({ name: '🟡 Maybe', value: maybeNames, inline: true });
-    }
-    if (standbyNames) {
-      embed.addFields({ name: '🟠 Standby', value: standbyNames, inline: true });
-    }
-
-    embed
+      )
       .setFooter({ text: 'Chronomancer\'s Book — 5-Minute Warning' })
       .setTimestamp();
 
@@ -565,7 +529,6 @@ async function sendFiveMinNotification(list) {
         .setStyle(ButtonStyle.Link),
     );
 
-    // Post in the category's own channel (not just notify channel)
     const categoryChannel = await client.channels.fetch(targetChannelId).catch(() => null);
     if (categoryChannel) {
       await categoryChannel.send({
@@ -575,7 +538,6 @@ async function sendFiveMinNotification(list) {
       });
     }
 
-    // Also post to dedicated notify channel if different
     if (DISCORD_NOTIFY_CHANNEL && DISCORD_NOTIFY_CHANNEL !== targetChannelId) {
       const notifyChannel = await client.channels.fetch(DISCORD_NOTIFY_CHANNEL).catch(() => null);
       if (notifyChannel) {
@@ -584,6 +546,16 @@ async function sendFiveMinNotification(list) {
           embeds: [embed],
           components: [linkBtn],
         });
+      }
+    }
+
+    // Send DMs to all registered users who have linked their discord_id
+    for (const s of signups) {
+      if (s.discord_id) {
+        try {
+          const user = await client.users.fetch(s.discord_id);
+          await user.send(`🔔 **Erinnerung:** Das Event **${list.title}** beginnt in etwa 5 Minuten!`);
+        } catch(e) { console.error(`Failed to DM user ${s.discord_id}`); }
       }
     }
 
@@ -611,7 +583,6 @@ async function pollLists() {
       }
     }
 
-    // Remove messages for expired/filtered lists
     for (const [listId, { messageId, channelId }] of postedLists) {
       const stillExists = sorted.find(l => l.id === listId);
       if (!stillExists) {
@@ -629,7 +600,6 @@ async function pollLists() {
       }
     }
 
-    // Also poll removal requests every cycle
     await pollRemovalRequests();
 
   } catch (err) {
@@ -666,7 +636,6 @@ const commands = [
     .setDescription('Show all available categories')
     .toJSON(),
 
-  // ── NEW: Admin linking ──
   new SlashCommandBuilder()
     .setName('link-admin')
     .setDescription('Link your Discord account as an admin to receive removal request notifications & DMs')
@@ -709,10 +678,8 @@ async function registerSlashCommands() {
 // ── Interaction handler ───────────────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
 
-  // ── Slash commands ─────────────────────────────────────────────────────
   if (interaction.isChatInputCommand()) {
 
-    // /list-categories
     if (interaction.commandName === 'list-categories') {
       await interaction.deferReply({ ephemeral: true });
       try {
@@ -736,7 +703,6 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
 
-    // /create-list
     if (interaction.commandName === 'create-list') {
       await interaction.deferReply({ ephemeral: true });
       const title       = interaction.options.getString('title');
@@ -788,7 +754,6 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    // /link-admin
     if (interaction.commandName === 'link-admin') {
       await interaction.deferReply({ ephemeral: true });
       const pw = interaction.options.getString('password') || '';
@@ -803,7 +768,6 @@ client.on('interactionCreate', async (interaction) => {
       );
     }
 
-    // /unlink-admin
     if (interaction.commandName === 'unlink-admin') {
       await interaction.deferReply({ ephemeral: true });
       if (!isLinkedAdmin(interaction.user.id)) {
@@ -813,7 +777,6 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.editReply('✅ Your Discord account has been **unlinked** from admin notifications.');
     }
 
-    // /list-admins
     if (interaction.commandName === 'list-admins') {
       await interaction.deferReply({ ephemeral: true });
       const pw = interaction.options.getString('password') || '';
@@ -836,7 +799,6 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.editReply({ embeds: [embed] });
     }
 
-    // /pending-requests
     if (interaction.commandName === 'pending-requests') {
       await interaction.deferReply({ ephemeral: true });
       const pw = interaction.options.getString('password') || '';
@@ -856,7 +818,6 @@ client.on('interactionCreate', async (interaction) => {
           ).join('\n\n'))
           .setFooter({ text: `${requests.length} pending request(s)` });
 
-        // Post each with buttons so admin can act
         await interaction.editReply({ embeds: [embed] });
 
         for (const req of requests) {
@@ -870,11 +831,9 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 
-  // ── Button clicks ──────────────────────────────────────────────────────
   if (interaction.isButton()) {
     const id = interaction.customId;
 
-    // Refresh list
     if (id.startsWith('refresh__')) {
       const listId = parseInt(id.split('__')[1], 10);
       await interaction.deferUpdate();
@@ -882,7 +841,6 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    // Sign up (sure / maybe)
     if (id.startsWith('signup_sure__') || id.startsWith('signup_maybe__')) {
       const parts  = id.split('__');
       const status = parts[0].replace('signup_', '');
@@ -917,7 +875,6 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    // ── NEW: Cancel / Request slot removal ──
     if (id.startsWith('cancel_request__')) {
       const listId = id.split('__')[1];
 
@@ -959,11 +916,9 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    // ── Admin: Accept removal request ──
     if (id.startsWith('req_accept__')) {
       const requestId = parseInt(id.split('__')[1], 10);
 
-      // Check if user is a linked admin
       if (!isLinkedAdmin(interaction.user.id)) {
         await interaction.reply({
           content: `❌ You are not a linked admin. Use \`/link-admin\` with the admin password to link your account.`,
@@ -978,16 +933,12 @@ client.on('interactionCreate', async (interaction) => {
         console.log(`✅  Admin ${interaction.user.tag} accepted removal request ${requestId}`);
         await resolveRequestMessage(requestId, true, interaction.user.tag);
 
-        // Refresh the affected list embed
-        const allRequests = await apiGet('/api/delete-requests').catch(() => []);
-        // Also try to refresh by finding which list this was for
-        // We stored the request info in the embed — try to get list id from the API
         for (const [listId] of postedLists) {
           try { await refreshListMessage(listId); } catch { /* ignore */ }
         }
 
         await interaction.followUp({
-          content: `✅ Request **#${requestId}** accepted by **${escMd(interaction.user.tag)}** — slot has been removed.`,
+          content: `✅ Request **#${requestId}** accepted by **${escMd(interaction.user.tag)}** — slot has been removed (and waitlist updated if applicable).`,
           ephemeral: false,
         });
       } catch (err) {
@@ -996,7 +947,6 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    // ── Admin: Deny removal request ──
     if (id.startsWith('req_deny__')) {
       const requestId = parseInt(id.split('__')[1], 10);
 
@@ -1025,10 +975,8 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 
-  // ── Modal submits ──────────────────────────────────────────────────────
   if (interaction.type === InteractionType.ModalSubmit) {
 
-    // Signup modal
     if (interaction.customId.startsWith('modal_signup__')) {
       const parts    = interaction.customId.split('__');
       const status   = parts[1];
@@ -1042,25 +990,27 @@ client.on('interactionCreate', async (interaction) => {
         const full    = await apiGet(`/api/lists/${listId}`);
         const signups = full.signups || [];
         const taken   = new Set(signups.map(s => s.slot_number));
+        const maxSlotsAllowed = full.slots + 2;
 
         let slotNumber;
         if (slotRaw) {
           slotNumber = parseInt(slotRaw, 10);
-          if (isNaN(slotNumber) || slotNumber < 1 || slotNumber > full.slots) {
-            return interaction.editReply({ content: `❌ Invalid slot. Valid range: 1–${full.slots}.` });
+          if (isNaN(slotNumber) || slotNumber < 1 || slotNumber > maxSlotsAllowed) {
+            return interaction.editReply({ content: `❌ Invalid slot. Valid range: 1–${maxSlotsAllowed} (including 2 waitlist slots).` });
           }
           if (taken.has(slotNumber)) {
             return interaction.editReply({ content: `❌ Slot #${slotNumber} is taken. Choose another.` });
           }
         } else {
           slotNumber = null;
-          for (let i = 1; i <= full.slots; i++) {
+          for (let i = 1; i <= maxSlotsAllowed; i++) {
             if (!taken.has(i)) { slotNumber = i; break; }
           }
-          if (!slotNumber) return interaction.editReply({ content: '❌ All slots are taken!' });
+          if (!slotNumber) return interaction.editReply({ content: '❌ All slots and waitlist positions are taken!' });
         }
 
-        const result = await apiPost(`/api/lists/${listId}/signup`, { slot_number: slotNumber, nickname, status });
+        const discord_id = interaction.user.id;
+        const result = await apiPost(`/api/lists/${listId}/signup`, { slot_number: slotNumber, nickname, status, discord_id });
         if (result.error) return interaction.editReply({ content: `❌ ${result.error}` });
 
         const emoji = status === 'sure' ? '✅' : '🟡';
@@ -1074,7 +1024,6 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    // ── NEW: Cancel / Removal request modal ──
     if (interaction.customId.startsWith('modal_cancel__')) {
       const listId   = parseInt(interaction.customId.split('__')[1], 10);
       const nickname = interaction.fields.getTextInputValue('nickname').trim();
@@ -1104,7 +1053,6 @@ client.on('interactionCreate', async (interaction) => {
           content: `✅ Your cancellation request for **Slot #${slotNumber}** has been submitted!\n> Reason: _${escMd(reason)}_\n\nAn admin will review it shortly.`,
         });
 
-        // Immediately notify admins of the new request
         await pollRemovalRequests();
 
       } catch (err) {
