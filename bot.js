@@ -249,10 +249,10 @@ function buildEmbed(list, signups, catName, catColor) {
   // Waitlist
   const waiting = signups.filter(s => s.slot_number > list.slots).sort((a,b) => a.slot_number - b.slot_number);
   if (waiting.length > 0) {
-    slotLines.push('\n**⏳ Warteliste (Reserviert):**');
+    slotLines.push('\n**⏳ Waitlist (Reserved):**');
     waiting.forEach((s, idx) => {
       const name = s.discord_id ? `<@${s.discord_id}>` : escMd(s.nickname);
-      slotLines.push(`\`R${idx+1}\` ${slotStatusEmoji(s.status)} **${name}**`);
+      slotLines.push(`\`W${idx+1}\` ${slotStatusEmoji(s.status)} **${name}**`);
     });
   }
 
