@@ -1,14 +1,18 @@
 /**
- * Chronomancer's Book — Discord Bot (Enhanced v2)
+ * Chronomancer's Book — Discord Bot (Enhanced v3)
  * ================================================
- * NEW FEATURES:
- * - 5-minute pre-event notifications (improved) + Direct Messages
- * - Waitlist System with Auto-Promotion
- * - Users can request slot removal via Discord button
- * - Admins can link their Discord user ID via /link-admin
- * - Linked admins receive DM or channel notifications for removal requests
- * - Admins can approve/deny removal requests directly in Discord
- * - Multi-admin support
+ * CHANGES v3:
+ * - /refresh-channel: re-posts all active lists for the current channel's category
+ * - All slash commands usable from ANY channel (not just the main channel)
+ * - Waitlist label changed from German "Warteliste" to English "Waitlist"
+ * - 5-min DM reminder translated to English
+ *
+ * BUGFIX v3.1:
+ * - /refresh-channel: explicit String() cast on interaction.channelId to avoid
+ *   silent BigInt/string comparison mismatches
+ * - Added debug logging to refresh-channel for easier diagnosis
+ * - Error message now shows channel ID + map when no lists are found
+ * - Added missing return statements to prevent fall-through after editReply
  */
 
 'use strict';
@@ -156,19 +160,48 @@ async function ensureAdminSession() {
 }
 
 // ── State ─────────────────────────────────────────────────────────────────
-const postedLists   = new Map();
-const listColors    = new Map();
-const notifiedLists = new Set();
+const postedLists    = new Map();
+const listColors     = new Map();
+const notifiedLists  = new Set();
 const postedRequests = new Map();
 const processedRequests = new Set();
 
 // ── Discord Client ────────────────────────────────────────────────────────
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages] });
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.DirectMessages,
+  ],
+});
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 function channelIdForCategory(categoryName) {
   const key = (categoryName || '').toLowerCase();
   return CATEGORY_CHANNEL_MAP[key] || DISCORD_CHANNEL_ID;
+}
+
+/**
+ * Returns all category names (lowercase) that belong to a given channelId.
+ * If channelId is the default channel, also includes categories with no mapping.
+ */
+function categoriesForChannel(channelId) {
+  const mapped = Object.entries(CATEGORY_CHANNEL_MAP)
+    .filter(([, chId]) => chId === channelId)
+    .map(([cat]) => cat);
+
+  const isDefault = channelId === DISCORD_CHANNEL_ID;
+  if (isDefault) {
+    return { mapped, includeUnmapped: true };
+  }
+  return { mapped, includeUnmapped: false };
+}
+
+function listBelongsToChannel(list, channelId) {
+  const { mapped, includeUnmapped } = categoriesForChannel(channelId);
+  const catKey = (list.category_name || '').toLowerCase();
+  if (mapped.includes(catKey)) return true;
+  if (includeUnmapped && !CATEGORY_CHANNEL_MAP[catKey]) return true;
+  return false;
 }
 
 function hexColor(hex) {
@@ -233,7 +266,7 @@ function buildEmbed(list, signups, catName, catColor) {
   const channelStr = list.channel    ? ` · 📡 Ch. ${list.channel}` : '';
 
   const slotLines = [];
-  
+
   // Normal Slots
   for (let i = 0; i < list.slots; i++) {
     const n = i + 1;
@@ -247,12 +280,12 @@ function buildEmbed(list, signups, catName, catColor) {
   }
 
   // Waitlist
-  const waiting = signups.filter(s => s.slot_number > list.slots).sort((a,b) => a.slot_number - b.slot_number);
+  const waiting = signups.filter(s => s.slot_number > list.slots).sort((a, b) => a.slot_number - b.slot_number);
   if (waiting.length > 0) {
     slotLines.push('\n**⏳ Waitlist (Reserved):**');
     waiting.forEach((s, idx) => {
       const name = s.discord_id ? `<@${s.discord_id}>` : escMd(s.nickname);
-      slotLines.push(`\`W${idx+1}\` ${slotStatusEmoji(s.status)} **${name}**`);
+      slotLines.push(`\`W${idx + 1}\` ${slotStatusEmoji(s.status)} **${name}**`);
     });
   }
 
@@ -396,10 +429,10 @@ async function notifyAdminsOfRequest(req) {
     .setColor(0xff4444)
     .setTitle('⚠️ Slot Removal Request')
     .addFields(
-      { name: '👤 Nickname',  value: escMd(req.nickname),                                  inline: true },
-      { name: '📋 List',      value: escMd(req.list_title || `#${req.list_id}`),            inline: true },
-      { name: '#️⃣  Slot',     value: String(req.slot_number),                              inline: true },
-      { name: '📅 Date',      value: fmtDate(req.event_date),                              inline: true },
+      { name: '👤 Nickname',  value: escMd(req.nickname),                                    inline: true },
+      { name: '📋 List',      value: escMd(req.list_title || `#${req.list_id}`),              inline: true },
+      { name: '#️⃣  Slot',     value: String(req.slot_number),                                inline: true },
+      { name: '📅 Date',      value: fmtDate(req.event_date),                                inline: true },
       { name: '💬 Reason',    value: req.reason ? escMd(req.reason) : '_(no reason given)_', inline: false },
     )
     .setFooter({ text: `Request ID: ${req.id} · Chronomancer's Book` })
@@ -514,10 +547,10 @@ async function sendFiveMinNotification(list) {
       .setColor(0xff4444)
       .setTitle(`⏰ Starting in ~5 minutes: **${list.title}**`)
       .addFields(
-        { name: '📅 Date & Time',  value: `${fmtDate(list.event_date)} 🕐 ${list.event_time}`,    inline: true },
-        { name: '🗂️ Category',     value: list.category_name || '–',                              inline: true },
-        { name: '🪑 Slots',        value: `${filled}/${list.slots} filled (${free} free)`,        inline: true },
-        { name: '✅ Confirmed',     value: participantNames || '–',                                inline: false },
+        { name: '📅 Date & Time',  value: `${fmtDate(list.event_date)} 🕐 ${list.event_time}`, inline: true },
+        { name: '🗂️ Category',     value: list.category_name || '–',                           inline: true },
+        { name: '🪑 Slots',        value: `${filled}/${list.slots} filled (${free} free)`,     inline: true },
+        { name: '✅ Confirmed',     value: participantNames || '–',                              inline: false },
       )
       .setFooter({ text: 'Chronomancer\'s Book — 5-Minute Warning' })
       .setTimestamp();
@@ -549,13 +582,13 @@ async function sendFiveMinNotification(list) {
       }
     }
 
-    // Send DMs to all registered users who have linked their discord_id
+    // DM all signed-up users who linked their Discord
     for (const s of signups) {
       if (s.discord_id) {
         try {
           const user = await client.users.fetch(s.discord_id);
-          await user.send(`🔔 **Erinnerung:** Das Event **${list.title}** beginnt in etwa 5 Minuten!`);
-        } catch(e) { console.error(`Failed to DM user ${s.discord_id}`); }
+          await user.send(`🔔 **Reminder:** The event **${list.title}** starts in approximately 5 minutes!`);
+        } catch { console.warn(`⚠️  Could not DM user ${s.discord_id}`); }
       }
     }
 
@@ -637,6 +670,11 @@ const commands = [
     .toJSON(),
 
   new SlashCommandBuilder()
+    .setName('refresh-channel')
+    .setDescription('Re-post all active lists for this channel\'s category')
+    .toJSON(),
+
+  new SlashCommandBuilder()
     .setName('link-admin')
     .setDescription('Link your Discord account as an admin to receive removal request notifications & DMs')
     .addStringOption(opt =>
@@ -678,6 +716,7 @@ async function registerSlashCommands() {
 // ── Interaction handler ───────────────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
 
+  // ── Slash Commands (usable from ANY channel) ──────────────────────────
   if (interaction.isChatInputCommand()) {
 
     if (interaction.commandName === 'list-categories') {
@@ -752,6 +791,76 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.editReply(`❌ Error: ${err.message}`);
       }
       return;
+    }
+
+    // ── /refresh-channel ────────────────────────────────────────────────
+    if (interaction.commandName === 'refresh-channel') {
+      await interaction.deferReply({ ephemeral: true });
+
+      try {
+        // Explicit String() cast — prevents silent BigInt/string comparison failures
+        const currentChannelId = String(interaction.channelId);
+
+        console.log(`🔄 refresh-channel called from channel: ${currentChannelId}`);
+        console.log(`🗂️  CATEGORY_CHANNEL_MAP:`, CATEGORY_CHANNEL_MAP);
+
+        const upcoming = await apiGet('/api/lists/upcoming');
+        console.log(`📋 Total upcoming lists: ${upcoming.length}`);
+
+        const filtered = upcoming
+          .filter(l => categoryAllowed(l.category_name))
+          .filter(l => listBelongsToChannel(l, currentChannelId));
+
+        console.log(`✅ Lists matching this channel: ${filtered.length}`);
+
+        if (!filtered.length) {
+          return interaction.editReply(
+            `ℹ️ No active lists found for this channel.\n` +
+            `Channel ID: \`${currentChannelId}\`\n` +
+            `Mapped categories: \`${JSON.stringify(CATEGORY_CHANNEL_MAP)}\``
+          );
+        }
+
+        // Delete old posted messages for these lists in this channel
+        for (const list of filtered) {
+          const existing = postedLists.get(list.id);
+          if (existing && existing.channelId === currentChannelId) {
+            try {
+              const ch = await client.channels.fetch(existing.channelId).catch(() => null);
+              if (ch) {
+                const msg = await ch.messages.fetch(existing.messageId).catch(() => null);
+                if (msg) await msg.delete();
+              }
+            } catch { /* already gone */ }
+            postedLists.delete(list.id);
+          }
+        }
+
+        // Re-post all matching lists fresh
+        let count = 0;
+        for (const list of sortLists(filtered)) {
+          try {
+            await postOrUpdateList(list, list.category_name || '', list.category_color || '#1a4a7a');
+            listColors.set(list.id, list.category_color || '#1a4a7a');
+            count++;
+          } catch (err) {
+            console.error(`refresh-channel: failed to post list ${list.id}:`, err.message);
+          }
+        }
+
+        const { mapped } = categoriesForChannel(currentChannelId);
+        const catLabel = mapped.length
+          ? mapped.map(c => `**${c}**`).join(', ')
+          : '*(default)*';
+
+        return interaction.editReply(
+          `✅ Re-posted **${count}** list(s) for ${catLabel} in this channel.`
+        );
+
+      } catch (err) {
+        console.error('refresh-channel error:', err);
+        return interaction.editReply(`❌ Error: ${err.message}`);
+      }
     }
 
     if (interaction.commandName === 'link-admin') {
@@ -831,6 +940,7 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 
+  // ── Buttons ─────────────────────────────────────────────────────────────
   if (interaction.isButton()) {
     const id = interaction.customId;
 
@@ -975,6 +1085,7 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 
+  // ── Modal Submits ────────────────────────────────────────────────────────
   if (interaction.type === InteractionType.ModalSubmit) {
 
     if (interaction.customId.startsWith('modal_signup__')) {
@@ -1013,9 +1124,12 @@ client.on('interactionCreate', async (interaction) => {
         const result = await apiPost(`/api/lists/${listId}/signup`, { slot_number: slotNumber, nickname, status, discord_id });
         if (result.error) return interaction.editReply({ content: `❌ ${result.error}` });
 
+        const isWaitlist = slotNumber > full.slots;
         const emoji = status === 'sure' ? '✅' : '🟡';
         await interaction.editReply({
-          content: `${emoji} **${escMd(nickname)}** signed up for **Slot #${slotNumber}** (${status === 'sure' ? 'Sure' : 'Maybe'})!`,
+          content: isWaitlist
+            ? `⏳ **${escMd(nickname)}** added to the **Waitlist** (position W${slotNumber - full.slots})!`
+            : `${emoji} **${escMd(nickname)}** signed up for **Slot #${slotNumber}** (${status === 'sure' ? 'Sure' : 'Maybe'})!`,
         });
         await refreshListMessage(listId);
       } catch (err) {
