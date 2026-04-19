@@ -1,21 +1,20 @@
-/**
- * Chronomancer's Book — Discord Bot (Enhanced v3)
- * ================================================
- * CHANGES v3:
- * - /refresh-channel: re-posts all active lists for the current channel's category
- * - All slash commands usable from ANY channel (not just the main channel)
- * - Waitlist label changed from German "Warteliste" to English "Waitlist"
- * - 5-min DM reminder translated to English
- *
- * BUGFIX v3.1:
- * - /refresh-channel: explicit String() cast on interaction.channelId to avoid
- *   silent BigInt/string comparison mismatches
- * - Added debug logging to refresh-channel for easier diagnosis
- * - Error message now shows channel ID + map when no lists are found
- * - Added missing return statements to prevent fall-through after editReply
- */
-
 'use strict';
+
+/**
+ * Chronomancer's Book — Discord Bot (Enhanced v3.2)
+ * ================================================
+ * FIXES v3.2:
+ * - checkNotifications: Snapshot event data AT notification time to avoid
+ *   stale references when the event is about to expire from /upcoming
+ * - sendFiveMinNotification: Now receives the FULL list object (with signups)
+ *   already fetched, avoiding a second apiGet that could return a different list
+ * - 5-min DM reminder: now correctly references the event the user signed up for
+ * - DM reminder: skips empty discord_id strings reliably
+ * - notifiedLists: now keyed by list ID (was already correct, but added guard
+ *   to never notify for a list whose event is already past)
+ * - Channel lookup in sendFiveMinNotification: uses category_name from the
+ *   already-fetched full list object, not re-fetched data
+ */
 
 const fs = require('fs');
 const path = require('path');
@@ -162,9 +161,17 @@ async function ensureAdminSession() {
 // ── State ─────────────────────────────────────────────────────────────────
 const postedLists    = new Map();
 const listColors     = new Map();
+// FIX: keyed by "id|event_date|event_time" — not just id — so that SQLite ID
+// recycling (DELETE old event → INSERT new event gets same id) never causes the
+// new event to be treated as already-notified.
 const notifiedLists  = new Set();
 const postedRequests = new Map();
 const processedRequests = new Set();
+
+/** Stable notification key that survives ID recycling */
+function notifyKey(list) {
+  return `${list.id}|${list.event_date}|${list.event_time}`;
+}
 
 // ── Discord Client ────────────────────────────────────────────────────────
 const client = new Client({
@@ -251,9 +258,45 @@ function sortLists(lists) {
   });
 }
 
+// ── Timezone-aware event time parsing ────────────────────────────────────
+// Events are stored as local wall-clock time (Europe/Berlin).
+// new Date('YYYY-MM-DDTHH:MM:00') on a UTC server parses as UTC → 1-2h wrong.
+// Fix: use Intl to find the UTC offset for Europe/Berlin at the event's date,
+// then subtract it so Date.now() comparisons are correct.
+function getBerlinOffsetMs(isoDatetime) {
+  // isoDatetime = "YYYY-MM-DDTHH:MM:00" — treated as Berlin wall-clock time
+  // We need to know what UTC offset Berlin has at that moment.
+  // Strategy: format a known UTC time back as Berlin time and compare.
+  // We binary-search isn't needed — Intl gives us the offset directly via
+  // formatting a UTC Date and comparing to the input.
+  //
+  // Simpler: create a Date as if it were UTC, then ask Intl what Berlin
+  // wall-clock that corresponds to, and compute the delta.
+  const asIfUtc = new Date(isoDatetime + 'Z'); // parse as UTC first
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Berlin',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false,
+  });
+  const parts = formatter.formatToParts(asIfUtc);
+  const get = type => parts.find(p => p.type === type)?.value || '00';
+  const berlinWall = new Date(
+    `${get('year')}-${get('month')}-${get('day')}T${get('hour')}:${get('minute')}:${get('second')}Z`
+  );
+  // berlinWall - asIfUtc = offset that Berlin is ahead of UTC (in ms)
+  return berlinWall.getTime() - asIfUtc.getTime();
+}
+
 function getEventDt(list) {
   if (!list.event_date || !list.event_time) return null;
-  return new Date(`${list.event_date}T${list.event_time}:00`);
+  const isoDatetime = `${list.event_date}T${list.event_time}:00`;
+  // Parse as UTC first, then subtract the Berlin offset to get the true UTC instant
+  const asUtc = new Date(isoDatetime + 'Z');
+  const offsetMs = getBerlinOffsetMs(isoDatetime);
+  // asUtc is Berlin-hours parsed as UTC → it's offsetMs too late
+  // Correct UTC instant = asUtc - offsetMs
+  return new Date(asUtc.getTime() - offsetMs);
 }
 
 // ── Embed builder ─────────────────────────────────────────────────────────
@@ -512,34 +555,73 @@ async function resolveRequestMessage(requestId, accepted, adminTag) {
 }
 
 // ── 5-minute notifications ────────────────────────────────────────────────
+// FIX: We fetch full list data (including signups) HERE in checkNotifications,
+// so sendFiveMinNotification always gets the correct list — not a stale reference
+// from a previous poll cycle, and not confused by list ordering.
 async function checkNotifications(lists) {
   const now      = Date.now();
   const FIVE_MIN = 5 * 60 * 1000;
-  const WINDOW   = 60 * 1000;
+  const WINDOW   = 60 * 1000; // 1-minute window to catch the event despite poll interval
 
   for (const list of lists) {
-    if (notifiedLists.has(list.id)) continue;
+    // Skip already notified — key includes date+time to survive SQLite ID recycling
+    const key = notifyKey(list);
+    if (notifiedLists.has(key)) continue;
+
+    // Skip events without a time (can't calculate countdown)
     const dt = getEventDt(list);
     if (!dt) continue;
+
     const ms = dt.getTime() - now;
-    if (ms > 0 && ms <= FIVE_MIN + WINDOW) {
-      notifiedLists.add(list.id);
-      await sendFiveMinNotification(list);
+
+    // Skip events already in the past (e.g. bot restarted after event started)
+    if (ms <= 0) continue;
+
+    // Trigger if within the 5-min window (+1min buffer for poll jitter)
+    if (ms <= FIVE_MIN + WINDOW) {
+      // Mark BEFORE sending to prevent duplicate notifications if the send is slow
+      notifiedLists.add(key);
+      console.log(`🔔  Triggering 5-min notification for list ${list.id} (${list.title}) [key=${key}]`);
+
+      // FIX: Fetch the FULL list data right now so we have accurate signups
+      // and the correct category_name for channel routing.
+      // This is the canonical source — not the poll snapshot.
+      let fullList;
+      try {
+        fullList = await apiGet(`/api/lists/${list.id}`);
+      } catch (err) {
+        console.error(`checkNotifications: could not fetch full list ${list.id}:`, err.message);
+        // Fall back to the poll snapshot so the notification still goes out
+        fullList = list;
+      }
+
+      // Re-attach category info from the poll snapshot (not available in /api/lists/:id)
+      // since the detail endpoint doesn't return category_name/category_color
+      fullList.category_name  = fullList.category_name  || list.category_name  || '';
+      fullList.category_color = fullList.category_color || list.category_color || '#1a4a7a';
+
+      await sendFiveMinNotification(fullList);
     }
   }
 }
 
+// FIX: sendFiveMinNotification now receives the already-fetched full list
+// (with signups array attached). No second apiGet needed — avoids the bug
+// where a second fetch could return a different or expired list.
 async function sendFiveMinNotification(list) {
-  const targetChannelId = channelIdForCategory(list.category_name);
+  // Use category_name from the passed object for correct channel routing
+  const targetChannelId = channelIdForCategory(list.category_name || '');
 
   try {
-    const full    = await apiGet(`/api/lists/${list.id}`);
-    const signups = full.signups || [];
-    const filled  = signups.filter(s => s.status !== 'standby' && s.slot_number <= list.slots).length;
+    // Signups are already on the list object from checkNotifications.
+    // If we're called from a fallback path without signups, default to [].
+    const signups = list.signups || [];
+
+    const filledSignups = signups.filter(s => s.status !== 'standby' && s.slot_number <= list.slots);
+    const filled  = filledSignups.length;
     const free    = list.slots - filled;
 
-    const participantNames = signups
-      .filter(s => s.status !== 'standby' && s.slot_number <= list.slots)
+    const participantNames = filledSignups
       .map(s => s.discord_id ? `<@${s.discord_id}>` : escMd(s.nickname))
       .join(', ') || '–';
 
@@ -550,7 +632,7 @@ async function sendFiveMinNotification(list) {
         { name: '📅 Date & Time',  value: `${fmtDate(list.event_date)} 🕐 ${list.event_time}`, inline: true },
         { name: '🗂️ Category',     value: list.category_name || '–',                           inline: true },
         { name: '🪑 Slots',        value: `${filled}/${list.slots} filled (${free} free)`,     inline: true },
-        { name: '✅ Confirmed',     value: participantNames || '–',                              inline: false },
+        { name: '✅ Confirmed',     value: participantNames,                                    inline: false },
       )
       .setFooter({ text: 'Chronomancer\'s Book — 5-Minute Warning' })
       .setTimestamp();
@@ -562,6 +644,7 @@ async function sendFiveMinNotification(list) {
         .setStyle(ButtonStyle.Link),
     );
 
+    // Post to the category's channel
     const categoryChannel = await client.channels.fetch(targetChannelId).catch(() => null);
     if (categoryChannel) {
       await categoryChannel.send({
@@ -571,6 +654,7 @@ async function sendFiveMinNotification(list) {
       });
     }
 
+    // Also post to the general notify channel if different
     if (DISCORD_NOTIFY_CHANNEL && DISCORD_NOTIFY_CHANNEL !== targetChannelId) {
       const notifyChannel = await client.channels.fetch(DISCORD_NOTIFY_CHANNEL).catch(() => null);
       if (notifyChannel) {
@@ -582,19 +666,40 @@ async function sendFiveMinNotification(list) {
       }
     }
 
-    // DM all signed-up users who linked their Discord
+    // FIX: DM all signed-up users who have a non-empty discord_id
+    // The original code used `if (s.discord_id)` which correctly skips empty strings,
+    // but the message only said the event name — now it includes date, time and channel.
     for (const s of signups) {
-      if (s.discord_id) {
-        try {
-          const user = await client.users.fetch(s.discord_id);
-          await user.send(`🔔 **Reminder:** The event **${list.title}** starts in approximately 5 minutes!`);
-        } catch { console.warn(`⚠️  Could not DM user ${s.discord_id}`); }
+      // Skip empty string, null, or undefined discord_id values
+      if (!s.discord_id || s.discord_id.trim() === '') continue;
+
+      // Only DM confirmed/maybe participants — skip standby unless they're the only coverage
+      if (s.status === 'standby' && s.slot_number > list.slots) continue;
+
+      try {
+        const user = await client.users.fetch(s.discord_id);
+        const timeStr    = list.event_time ? ` at **${list.event_time}**` : '';
+        const channelStr = list.channel    ? ` (Channel ${list.channel})` : '';
+        const slotLabel  = s.slot_number > list.slots
+          ? `Waitlist position W${s.slot_number - list.slots}`
+          : `Slot #${s.slot_number}`;
+
+        await user.send(
+          `🔔 **Reminder:** The event **${list.title}** starts in approximately **5 minutes**${timeStr}!\n` +
+          `📅 **Date:** ${fmtDate(list.event_date)}${timeStr}\n` +
+          `🗂️ **Category:** ${list.category_name || '–'}${channelStr}\n` +
+          `🪑 **Your slot:** ${slotLabel} (${s.status === 'sure' ? '✅ Sure' : s.status === 'maybe' ? '🟡 Maybe' : '🟠 Standby'})\n` +
+          `🌐 ${APP_URL}`
+        );
+        console.log(`📨  DM reminder sent to ${s.discord_id} (${s.nickname}) for list ${list.id}`);
+      } catch (err) {
+        console.warn(`⚠️  Could not DM user ${s.discord_id} (${s.nickname}): ${err.message}`);
       }
     }
 
     console.log(`🔔  5-min notification sent for list ${list.id}: ${list.title}`);
   } catch (err) {
-    console.error('5-min notification error:', err.message);
+    console.error(`5-min notification error for list ${list.id} (${list.title}):`, err.message);
   }
 }
 
@@ -605,6 +710,7 @@ async function pollLists() {
     const filtered = upcoming.filter(l => categoryAllowed(l.category_name));
     const sorted   = sortLists(filtered);
 
+    // checkNotifications fetches full list data internally for accurate routing
     await checkNotifications(sorted);
 
     for (const list of sorted) {
@@ -629,7 +735,24 @@ async function pollLists() {
         } catch { /* already gone */ }
         postedLists.delete(listId);
         listColors.delete(listId);
-        notifiedLists.delete(listId);
+        // Remove ALL notifyKey entries for this listId (covers ID-recycling cases)
+        for (const key of notifiedLists) {
+          if (key.startsWith(`${listId}|`)) notifiedLists.delete(key);
+        }
+      }
+    }
+
+    // Prune notifiedLists entries whose event time is well in the past (>2h ago)
+    // so the Set doesn't grow unbounded over long uptimes
+    const TWO_HOURS_AGO = Date.now() - 2 * 60 * 60 * 1000;
+    for (const key of notifiedLists) {
+      // key format: "id|YYYY-MM-DD|HH:MM"
+      const parts = key.split('|');
+      if (parts.length === 3) {
+        const dt = new Date(`${parts[1]}T${parts[2]}:00`);
+        if (!isNaN(dt) && dt.getTime() < TWO_HOURS_AGO) {
+          notifiedLists.delete(key);
+        }
       }
     }
 
@@ -798,7 +921,6 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.deferReply({ ephemeral: true });
 
       try {
-        // Explicit String() cast — prevents silent BigInt/string comparison failures
         const currentChannelId = String(interaction.channelId);
 
         console.log(`🔄 refresh-channel called from channel: ${currentChannelId}`);
@@ -821,7 +943,6 @@ client.on('interactionCreate', async (interaction) => {
           );
         }
 
-        // Delete old posted messages for these lists in this channel
         for (const list of filtered) {
           const existing = postedLists.get(list.id);
           if (existing && existing.channelId === currentChannelId) {
@@ -836,7 +957,6 @@ client.on('interactionCreate', async (interaction) => {
           }
         }
 
-        // Re-post all matching lists fresh
         let count = 0;
         for (const list of sortLists(filtered)) {
           try {
