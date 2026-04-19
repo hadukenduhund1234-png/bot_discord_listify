@@ -679,7 +679,7 @@ async function sendFiveMinNotification(list) {
       try {
         const user = await client.users.fetch(s.discord_id);
         const timeStr    = list.event_time ? ` at **${list.event_time}**` : '';
-        const channelStr = list.channel    ? ` (Channel ${list.channel})` : '';
+        const channelStr = list.channel    ? ` (Channel **${list.channel}**)` : '';
         const slotLabel  = s.slot_number > list.slots
           ? `Waitlist position W${s.slot_number - list.slots}`
           : `Slot #${s.slot_number}`;
